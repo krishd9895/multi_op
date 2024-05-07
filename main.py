@@ -7,6 +7,7 @@ import zipfile
 import rarfile
 import shutil
 import py7zr
+from webserver import keep_alive
 
 telegram_token = os.environ['Bot_token']
 bot = telebot.TeleBot(telegram_token)
@@ -14,7 +15,7 @@ bot = telebot.TeleBot(telegram_token)
 # Dictionary to store user settings (image resize)
 user_settings = {}
 
-# Dictionary to track the processing status for each chat (pdf split)
+# Dictionary to track the processing status for each chat (pdf splitter)
 processing_status = {}
 
 # Pdf merger objects
@@ -516,4 +517,5 @@ def handle_text(message):
 
 
 # Start the bot
+keep_alive()
 bot.polling(none_stop=True, timeout=123)
