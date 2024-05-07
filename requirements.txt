@@ -1,4 +1,4 @@
-pyTelegramBotAPI==4.17.0
+pyTelegramBotAPI==4.15.4
 pillow==10.3.0
 Flask==2.0.1
 urllib3==2.2.1
