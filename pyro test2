@@ -5,22 +5,43 @@ from io import BytesIO
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 import patoolib
 import shutil
+import logging
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Pyrogram client initialization
-api_id = os.environ.get('API_ID')
-api_hash = os.environ.get('API_HASH')
-bot_token = os.environ.get('Bot_token')
+api_id = ""
+api_hash = ""
+bot_token = ""
 
 app = Client("pyrogram_bot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 
 # Session data for image to PDF conversion
 user_images = {}
 user_pdf_name = {}
+# Create base directory for image2pdf operations
+BASE_DIR = "image2pdf_temp"
+os.makedirs(BASE_DIR, exist_ok=True)
+def get_user_dir(chat_id):
+    """Create and return a directory for a specific user's images"""
+    user_dir = os.path.join(BASE_DIR, str(chat_id))
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
 
 # Settings for image resize
-user_settings = {}
+user_settings = {} # Dictionary to hold user settings
+# Ensure the main 'Resize' directory exists
+if not os.path.exists('Resize'):
+    os.makedirs('Resize')
+def get_user_folder(chat_id):
+    user_folder = os.path.join('Resize', str(chat_id))
+    if not os.path.exists(user_folder):
+        os.makedirs(user_folder)
+    return user_folder
 
 # Processing status for PDF splitting
 processing_status = {}
@@ -30,9 +51,15 @@ pdfs_received = []
 pdfs_received_messages = []
 progress_message = None
 merge_in_progress = False
+# Store merge sessions
+merge_sessions = {}
+def get_user_folder(chat_id):
+    """Create and return path to user's specific folder"""
+    folder_path = os.path.join('merged_pdfs', str(chat_id))
+    os.makedirs(folder_path, exist_ok=True)
+    return folder_path
 
 # Helper functions
-
 def get_unique_file_path(file_path):
     base_dir = os.path.dirname(file_path)
     base_name, ext = os.path.splitext(os.path.basename(file_path))
@@ -42,193 +69,512 @@ def get_unique_file_path(file_path):
         suffix += 1
     return file_path
 
-# Command handlers
 
+# Command handlers
 @app.on_message(filters.command("help"))
 async def handle_help(client, message):
     help_text = """
-This bot can perform various operations with PDF files and images.
+<b>This bot can perform various operations </b><br>
 
-**PDF Operations:**
-/mergepdf - Merge multiple PDF files into a single PDF.
+<b>PDF Operations:</b><br>
+- <b>/mergepdf</b>: Merge multiple PDF files into one.<br>
+- <b>/splitpdf</b>: Split a PDF file into individual pages.<br>
 
-/splitpdf - Split a PDF file into individual pages.
-    Reply to a PDF file with the '/splitpdf' command.
+<b>Unarchive Operations:</b><br>
+- <b>/unarchive</b>: Unarchive a compressed file (zip, rar, 7z).<br>
 
-**Image Operations:**
-/resizeimage - Resize an image.
+<b>Image Operations:</b><br>
+- <b>/resizeimage</b>: Resize an image.<br>
 
-**Image to PDF:**
-/image2pdf - convert images to pdf.
-
-**Archive Operations:**
-/unarchive - Unarchive a compressed file (zip, rar, 7z).
+- <b>/image2pdf</b>: Convert images to pdf.<br>
 """
-    await message.reply_text(help_text, parse_mode="Markdown")
+    await message.reply_text(help_text)
+
+
+@app.on_message(filters.command("resizeimage"))
+async def handle_resize_image_command(client, message):
+    try:
+        if message.text.split()[0] != "/resizeimage":
+            return
+        chat_id = message.chat.id
+
+        if not message.reply_to_message or not message.reply_to_message.photo:
+            await message.reply_text("Please reply to an image with the /resizeimage command.")
+            return
+
+        await message.reply_text("Processing your image...")
+
+        photo = message.reply_to_message.photo
+
+        # Download the photo
+        downloaded_file = await client.download_media(photo)
+
+        # Open the image using PIL
+        image = Image.open(downloaded_file)
+        user_folder = get_user_folder(chat_id)
+
+        user_settings[chat_id] = {
+            'command_state': 'choose_modification',
+            'image': image,
+            'user_folder': user_folder,
+            'original_path': downloaded_file
+        }
+
+        image_details = (
+            f"Image Details:\n\n"
+            f"File Size: {os.path.getsize(downloaded_file) / (1024 * 1024):.2f} MB "
+            f"({os.path.getsize(downloaded_file) / 1024:.2f} KB)\n"
+            f"Image Width: {image.width}px\n"
+            f"Image Height: {image.height}px"
+        )
+
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(text="Modify File Size", callback_data="modify_file_size")],
+            [InlineKeyboardButton(text="Modify File Dimensions", callback_data="modify_file_dimensions")]
+        ])
+
+        await message.reply_text(f"{image_details}\nPlease choose the modification option:", reply_markup=markup)
+
+    except Exception as e:
+        print(f"Error in handle_resize_image_command: {e}")
+        await message.reply_text("An error occurred while processing your image.")
+
+@app.on_callback_query(filters.regex('^(modify_file_size|modify_file_dimensions)$'))
+async def handle_callback(client, callback_query):
+    try:
+        chat_id = callback_query.message.chat.id
+        data = callback_query.data
+
+        if chat_id not in user_settings:
+            await callback_query.answer("Session expired. Please start over.", show_alert=True)
+            return
+
+        if data == 'modify_file_size':
+            await callback_query.message.reply_text("Please enter the desired file size in kilobytes (KB):")
+            user_settings[chat_id]['command_state'] = 'enter_file_size'
+        elif data == 'modify_file_dimensions':
+            await callback_query.message.reply_text("Please enter the desired width and height in pixels (separated by a space):")
+            user_settings[chat_id]['command_state'] = 'enter_dimensions'
+
+        await callback_query.answer()
+
+    except Exception as e:
+        print(f"Error in handle_callback: {e}")
+        await callback_query.answer("An error occurred.", show_alert=True)
+
+@app.on_message(filters.text & filters.private)
+async def handle_text(client, message):
+    try:
+        chat_id = message.chat.id
+
+        if chat_id not in user_settings:
+            return
+
+        command_state = user_settings[chat_id]['command_state']
+
+        if command_state == 'enter_file_size':
+            try:
+                target_file_size = float(message.text.strip())
+                if target_file_size <= 0:
+                    await message.reply_text("Please enter a positive file size.")
+                    return
+
+                image = user_settings[chat_id]['image']
+
+                # Binary search for the right quality
+                min_quality = 1
+                max_quality = 95
+                best_output = None
+                best_quality = None
+
+                while min_quality <= max_quality:
+                    quality = (min_quality + max_quality) // 2
+                    output = BytesIO()
+                    image.save(output, format='JPEG', quality=quality)
+                    size_kb = output.tell() / 1024
+
+                    if abs(size_kb - target_file_size) < 1 or max_quality - min_quality <= 1:
+                        best_output = output
+                        best_quality = quality
+                        break
+                    elif size_kb > target_file_size:
+                        max_quality = quality - 1
+                    else:
+                        min_quality = quality + 1
+
+                if best_output is None:
+                    await message.reply_text("Couldn't achieve the target file size. Please try a larger size.")
+                    return
+
+                output_path = os.path.join(user_settings[chat_id]['user_folder'], 'resized_image.jpg')
+                with open(output_path, 'wb') as f:
+                    f.write(best_output.getvalue())
+
+                await message.reply_photo(
+                    photo=output_path,
+                    caption=f"Resized Image Details:\n"
+                            f"File Size: {os.path.getsize(output_path) / 1024:.2f} KB\n"
+                            f"Quality: {best_quality}%\n"
+                            f"Dimensions: {image.width}x{image.height}px"
+                )
+
+                os.remove(output_path)
+                cleanup_user_data(chat_id)
+
+            except ValueError:
+                await message.reply_text("Invalid file size. Please enter a valid number in kilobytes (KB).")
+
+        elif command_state == 'enter_dimensions':
+            try:
+                width, height = map(int, message.text.strip().split())
+                if width <= 0 or height <= 0:
+                    await message.reply_text("Please enter positive dimensions.")
+                    return
+
+                image = user_settings[chat_id]['image']
+                resized_image = image.copy()
+                resized_image.thumbnail((width, height), Image.LANCZOS)
+
+                output_path = os.path.join(user_settings[chat_id]['user_folder'], 'resized_image.jpg')
+                resized_image.save(output_path, 'JPEG', quality=95)
+
+                await message.reply_photo(
+                    photo=output_path,
+                    caption=f"Resized Image Details:\n"
+                            f"File Size: {os.path.getsize(output_path) / 1024:.2f} KB\n"
+                            f"Dimensions: {resized_image.width}x{resized_image.height}px"
+                )
+
+                os.remove(output_path)
+                cleanup_user_data(chat_id)
+
+            except ValueError:
+                await message.reply_text("Invalid dimensions. Please enter two numbers separated by a space (e.g., '800 600').")
+
+    except Exception as e:
+        print(f"Error in handle_text: {e}")
+        await message.reply_text("An error occurred while processing your request.")
+        cleanup_user_data(chat_id)
+
+def cleanup_user_data(chat_id):
+    if chat_id in user_settings:
+        if 'original_path' in user_settings[chat_id]:
+            try:
+                os.remove(user_settings[chat_id]['original_path'])
+            except:
+                pass
+        del user_settings[chat_id]
+
+
+
+def clean_filename(filename):
+    """Clean filename to be safe for filesystem"""
+    # Remove invalid characters and trim spaces
+    cleaned = re.sub(r'[<>:"/\\|?*]', '', filename)
+    cleaned = cleaned.strip()
+    # Ensure it ends with .pdf
+    if not cleaned.lower().endswith('.pdf'):
+        cleaned += '.pdf'
+    # If filename becomes empty after cleaning, use default
+    if len(cleaned) <= 4:  # '.pdf' is 4 chars
+        cleaned = 'merged.pdf'
+    return cleaned
+
 
 @app.on_message(filters.command("mergepdf"))
 async def handle_mergepdf(client, message):
-    global pdfs_received, pdfs_received_messages, progress_message, merge_in_progress
-    pdfs_received = []
-    pdfs_received_messages = []
-    progress_message = None
-    merge_in_progress = True
-    await message.reply_text("Please send the PDFs one by one. Send 'DONE' when finished.", parse_mode="Markdown")
+    chat_id = message.chat.id
 
-@app.on_message(filters.document & filters.mime_type("application/pdf"))
+    # Initialize new merge session
+    merge_sessions[chat_id] = {
+        'pdfs_received': [],
+        'status_messages': [],
+        'in_progress': True,
+        'folder_path': get_user_folder(chat_id)
+    }
+
+    await message.reply_text(
+        "Please send the PDFs one by one (maximum 5 files, 5MB each).\n"
+        "When finished, you can either:\n"
+        "• Send 'DONE' to merge with default filename\n"
+        "• Send any other text to use as the merged file's name"
+    )
+
+
+@app.on_message(filters.document)
 async def handle_pdf(client, message):
-    global pdfs_received, pdfs_received_messages, progress_message, merge_in_progress
-    if merge_in_progress:
-        file_size = message.document.file_size
-        if file_size > 5 * 1024 * 1024:
-            await message.reply_text("File size exceeds the limit of 5 MB")
-            return
+    chat_id = message.chat.id
 
-        if len(pdfs_received) >= 5:
-            await message.reply_text("Maximum file limit of 5 reached. Please send 'done' to start merging.")
-            return
+    # Debug print
+    print(f"Received document: {message.document.mime_type}, {message.document.file_name}")
 
-        pdfs_received.append((message.document.file_id, file_size))
-        count = len(pdfs_received)
-        if pdfs_received_messages:
-            try:
-                await client.delete_messages(message.chat.id, pdfs_received_messages[-1].message_id)
-                pdfs_received_messages.pop()
-            except:
-                pass
-        reply = await message.reply_text(f"{count} PDFs received so far. Please send 'DONE' when finished.", parse_mode="Markdown")
-        pdfs_received_messages.append(reply)
+    # Check if there's an active merge session
+    if chat_id not in merge_sessions:
+        return  # Silently ignore if no active session
 
-@app.on_message(filters.text & filters.regex("^DONE$", flags=re.IGNORECASE))
+    session = merge_sessions[chat_id]
+    if not session['in_progress']:
+        return
+
+    # Check if the file is a PDF
+    if not (message.document.mime_type == "application/pdf" or
+            (message.document.file_name and message.document.file_name.lower().endswith('.pdf'))):
+        await message.reply_text("❌ Please send only PDF files.")
+        return
+
+    # Validate file size
+    file_size = message.document.file_size
+    if file_size > 5 * 1024 * 1024:
+        await message.reply_text("❌ File size exceeds the limit of 5 MB")
+        return
+
+    # Check file limit
+    if len(session['pdfs_received']) >= 50:
+        await message.reply_text("❌ Maximum file limit of 50 reached. Send 'DONE' or filename to merge.")
+        return
+
+    # Store file information
+    file_info = {
+        'file_id': message.document.file_id,
+        'file_name': message.document.file_name or f"document_{len(session['pdfs_received']) + 1}.pdf",
+        'file_size': file_size
+    }
+    session['pdfs_received'].append(file_info)
+
+    # Delete previous status message if it exists
+    if session['status_messages']:
+        try:
+            await client.delete_messages(chat_id, session['status_messages'][-1].message_id)
+            session['status_messages'].pop()
+        except Exception as e:
+            print(f"Error deleting message: {e}")
+
+    # Send new status message
+    count = len(session['pdfs_received'])
+    reply = await message.reply_text(
+        f"✅ {count} PDF{'s' if count > 1 else ''} received:\n" +
+        "\n".join(f"{i + 1}. {pdf['file_name']}" for i, pdf in enumerate(session['pdfs_received'])) +
+        "\n\nSend more PDFs, 'DONE' for default filename, or send custom filename for the merged PDF."
+    )
+    session['status_messages'].append(reply)
+
+
+@app.on_message(filters.text)
 async def handle_merge(client, message):
-    global pdfs_received, pdfs_received_messages, progress_message, merge_in_progress
-    if merge_in_progress:
-        merge_in_progress = False
+    chat_id = message.chat.id
+
+    # Check for active session
+    if chat_id not in merge_sessions:
+        return  # Silently ignore if no active session
+
+    session = merge_sessions[chat_id]
+    if not session['in_progress']:
+        return
+
+    # Mark session as complete
+    session['in_progress'] = False
+
+    # Check if any PDFs were received
+    if not session['pdfs_received']:
+        await message.reply_text("❌ No PDFs received. Please send PDFs first.")
+        del merge_sessions[chat_id]  # Clean up session
+        return
+
+    # Check total size
+    total_size = sum(pdf['file_size'] for pdf in session['pdfs_received'])
+    if total_size > 100 * 1024 * 1024:
+        await message.reply_text("❌ Total file size exceeds 100 MB limit.")
+        del merge_sessions[chat_id]  # Clean up session
+        return
+
+    # Determine output filename
+    if message.text.strip().upper() == 'DONE':
+        output_filename = 'merged.pdf'
+    else:
+        output_filename = clean_filename(message.text.strip())
+
+    progress_msg = None
+    temp_files = []
+    output_path = None
+
+    try:
+        # Show progress message
+        progress_msg = await message.reply_text("🔄 Merging PDFs...")
+
+        # Create merger object
         merger = PdfMerger()
 
-        if not pdfs_received:
-            await message.reply_text("No PDFs received. Send the PDFs first.")
-            return
+        # Process each PDF
+        for i, pdf in enumerate(session['pdfs_received']):
+            file_path = os.path.join(session['folder_path'], f"temp_{i}.pdf")
+            temp_files.append(file_path)
 
-        total_size = sum(size for _, size in pdfs_received)
-        if total_size > 15 * 1024 * 1024:
-            await message.reply_text("Total file size exceeds the limit of 15 MB. Please send smaller PDFs.")
-            return
-
-        for msg in pdfs_received_messages:
             try:
-                await client.delete_messages(message.chat.id, msg.message_id)
-            except:
-                pass
+                # Download and merge
+                await client.download_media(pdf['file_id'], file_path)
+                merger.append(file_path)
+            except Exception as e:
+                print(f"Error processing file {i}: {e}")
+                raise
 
-        progress_message = await message.reply_text("Merging in progress...")
-
-        for index, (file_id, _) in enumerate(pdfs_received):
-            file_info = await client.get_file(file_id)
-            downloaded_file = await client.download_media(file_info)
-            file_path = os.path.join('merged_pdfs', f"file_{index}.pdf")
-
-            with open(file_path, 'wb') as f:
-                f.write(downloaded_file)
-
-            merger.append(file_path)
-
-        merged_file_path = get_unique_file_path('merged_pdfs/merged.pdf')
-        merger.write(merged_file_path)
+        # Save merged file
+        output_path = os.path.join(session['folder_path'], output_filename)
+        merger.write(output_path)
         merger.close()
 
-        try:
-            with open(merged_file_path, 'rb') as f:
-                await client.send_document(message.chat.id, f)
+        # Send merged file
+        await client.send_document(
+            chat_id,
+            output_path,
+            caption=f"✅ Successfully merged {len(session['pdfs_received'])} PDFs into '{output_filename}'!"
+        )
 
-            merged_count = len(pdfs_received)
-            await message.reply_text(f"Merging completed. {merged_count} PDFs merged.")
+    except Exception as e:
+        error_msg = f"❌ Error merging PDFs: {str(e)}"
+        print(error_msg)
+        await message.reply_text(error_msg)
 
-        except Exception as e:
-            await message.reply_text("Failed to send the merged PDF.")
-
+    finally:
         # Clean up
-        for index in range(len(pdfs_received)):
-            file_path = os.path.join('merged_pdfs', f"file_{index}.pdf")
-            if os.path.exists(file_path):
-                os.remove(file_path)
+        if progress_msg:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
 
-        if os.path.exists(merged_file_path):
-            os.remove(merged_file_path)
+        # Clean up temporary files but keep the output file
+        for file_path in temp_files:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                print(f"Error removing temp file: {e}")
 
-        try:
-            await client.delete_messages(message.chat.id, progress_message.message_id)
-        except:
-            pass
+        # Clean up session
+        if chat_id in merge_sessions:
+            del merge_sessions[chat_id]
 
-        pdfs_received = []
-        pdfs_received_messages = []
 
-        shutil.rmtree('merged_pdfs', ignore_errors=True)
+@app.on_message(filters.command("cleanup"))
+async def handle_cleanup(client, message):
+    """Optional command to cleanup user's folder"""
+    chat_id = message.chat.id
+    folder_path = get_user_folder(chat_id)
 
-    else:
-        await message.reply_text("Invalid command. Send '/help' for more information.")
+    try:
+        # Remove all files in the user's folder
+        for filename in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, filename)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+            except Exception as e:
+                print(f"Error removing file {filename}: {e}")
 
-@app.on_message(filters.command("unarchive") & filters.reply)
+        await message.reply_text("✅ Your storage has been cleaned up!")
+    except Exception as e:
+        await message.reply_text(f"❌ Error during cleanup: {str(e)}")
+
+
+# Create base archives directory if it doesn't exist
+ARCHIVES_BASE_DIR = "user_archives"
+os.makedirs(ARCHIVES_BASE_DIR, exist_ok=True)
+
+@app.on_message(filters.command("unarchive"))
 async def handle_unarchive_command(client, message):
-    if not message.reply_to_message or not message.reply_to_message.document:
+    # Check if the message is a reply and contains a document
+    if not message.reply_to_message:
         await message.reply_text("Please reply to an archive file with the /unarchive command.")
         return
 
-    replied_message = message.reply_to_message
-    file_name = replied_message.document.file_name
-
-    if not (file_name.endswith('.zip') or file_name.endswith('.rar') or file_name.endswith('.7z')):
-        await message.reply_text("This command only works with .zip, .rar, or .7z files.")
+    if not message.reply_to_message.document:
+        await message.reply_text("Please reply to an archive file with the /unarchive command.")
         return
 
     try:
+        replied_message = message.reply_to_message
+        file_name = replied_message.document.file_name
+        user_id = message.from_user.id
+
+        # Create user-specific archive directory
+        user_archive_dir = os.path.join(ARCHIVES_BASE_DIR, str(user_id))
+        os.makedirs(user_archive_dir, exist_ok=True)
+
+        # Validate file extension
+        valid_extensions = ['.zip', '.rar', '.7z']
+        if not any(file_name.endswith(ext) for ext in valid_extensions):
+            await message.reply_text("This command only works with .zip, .rar, or .7z files.")
+            return
+
+        # Inform user that extraction is starting
         await message.reply_text("File received. Extracting...")
 
-        file_info = await client.get_file(replied_message.document.file_id)
-        downloaded_file = await client.download_media(file_info)
+        # Download the file with explicit download method
+        file_path = await client.download_media(replied_message.document)
 
-        with open(file_name, 'wb') as new_file:
-            new_file.write(downloaded_file)
+        # Create a unique extraction directory for this archive
+        extraction_dir = os.path.join(user_archive_dir, os.path.splitext(file_name)[0])
+        os.makedirs(extraction_dir, exist_ok=True)
 
-        destination_dir = os.path.splitext(file_name)[0]  # Use the file name without extension as directory name
-        os.makedirs(destination_dir, exist_ok=True)
+        # Full path for the downloaded archive
+        full_file_path = os.path.join(extraction_dir, file_name)
 
-        # Use patool to extract the archive
-        patoolib.extract_archive(file_name, outdir=destination_dir, verbosity=-1)
+        # Move downloaded file to extraction directory
+        shutil.move(file_path, full_file_path)
 
-        for subdir, _, _ in os.walk(destination_dir):
-            if subdir != destination_dir:
-                await message.reply_text(f"Files in {os.path.relpath(subdir, destination_dir)}:")
-                await send_files_in_directory(client, message.chat.id, subdir)
+        # Extract archive
+        patoolib.extract_archive(full_file_path, outdir=extraction_dir, verbosity=-1)
 
-        await message.reply_text("Extraction complete.")
+        # Send files in each subdirectory
+        files_sent = 0
+        for root, dirs, files in os.walk(extraction_dir):
+            if root != extraction_dir:
+                relative_path = os.path.relpath(root, extraction_dir)
+                await message.reply_text(f"Files in {relative_path}:")
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        await send_file(client, message.chat.id, file_path)
+                        files_sent += 1
+                    except Exception as file_send_error:
+                        logger.error(f"Error sending file {file}: {file_send_error}")
 
-        os.remove(file_name)
-        shutil.rmtree(destination_dir)
+        # Completion message
+        if files_sent > 0:
+            await message.reply_text(f"Extraction complete. {files_sent} files extracted.")
+        else:
+            await message.reply_text("Extraction complete, but no files were found.")
 
     except patoolib.util.PatoolError as e:
+        logger.error(f"Patool extraction error: {e}")
         await message.reply_text(f"Error extracting archive: {e}")
     except Exception as e:
-        await message.reply_text(f"An error occurred: {e}")
-        if os.path.exists(file_name):
-            os.remove(file_name)
+        logger.error(f"Unhandled error in unarchive command: {e}")
+        await message.reply_text(f"An unexpected error occurred: {e}")
+    finally:
+        # Clean up files
+        try:
+            # Remove the entire user's archive directory to clean up
+            if 'user_archive_dir' in locals() and os.path.exists(user_archive_dir):
+                shutil.rmtree(user_archive_dir)
+        except Exception as cleanup_error:
+            logger.error(f"Error during cleanup: {cleanup_error}")
+
 
 async def send_file(client, chat_id, file_path):
-    with open(file_path, 'rb') as file:
-        await client.send_document(chat_id, file)
-
-async def send_files_in_directory(client, chat_id, directory_path):
-    files = [f for f in os.listdir(directory_path) if os.path.isfile(os.path.join(directory_path, f))]
-    for file in files:
-        await send_file(client, chat_id, os.path.join(directory_path, file))
-
+    """Send a single file to the specified chat."""
+    try:
+        with open(file_path, 'rb') as file:
+            await client.send_document(chat_id, file)
+    except Exception as e:
+        logger.error(f"Failed to send file {file_path}: {e}")
+        raise
 
 
 @app.on_message(filters.command("splitpdf"))
 async def handle_split_pdf(client, message):
     if not message.reply_to_message or not message.reply_to_message.document:
-        await message.reply_text("Please reply to a PDF file with /splitpdf command.")
+        await message.reply_text("Please reply to a PDF file with the /splitpdf command.")
         return
 
     replied_document = message.reply_to_message.document
@@ -236,75 +582,122 @@ async def handle_split_pdf(client, message):
     file_size = replied_document.file_size
     file_name = replied_document.file_name
 
+    # Validate file type and size
     if not file_name.lower().endswith('.pdf'):
-        await message.reply_text("Invalid file format. Please send a PDF file.")
+        await message.reply_text("Invalid file format. Please reply to a valid PDF file.")
         return
 
-    if file_size > 20000000:
-        await message.reply_text("Sorry, the maximum file size allowed is 20 MB.")
+    if file_size > 200 * 1024 * 1024:  # 200 MB limit
+        await message.reply_text("Sorry, the maximum file size allowed is 200 MB.")
         return
 
-    if message.chat.id in processing_status and processing_status[message.chat.id]:
-        await message.reply_text("Sorry, another PDF file is currently being processed. Please wait for the current process to complete.")
+    # Check if another process is running for this chat
+    if processing_status.get(message.chat.id, False):
+        await message.reply_text(
+            "Sorry, another PDF file is currently being processed. Please wait for the current process to complete."
+        )
         return
+
+    # Create a directory for the user's split PDF files
+    user_dir = f"{message.chat.id}_pdfsplit"
+    if not os.path.exists(user_dir):
+        os.makedirs(user_dir)
 
     processing_status[message.chat.id] = True
-    await message.reply_text("PDF file received. Splitting process started...")
+    await message.reply_text("PDF file received. Starting the splitting process...")
 
-    file_info = await client.get_file(file_id)
-    downloaded_file = await client.download_media(file_info)
+    try:
+        # Download the PDF file
+        pdf_path = f"{user_dir}/{file_id}.pdf"
+        downloaded_file_path = await client.download_media(replied_document, file_name=pdf_path)
+        print(f"Downloaded file saved to: {pdf_path}")
 
-    pdf_path = 'temp.pdf'
-    with open(pdf_path, 'wb') as f:
-        f.write(downloaded_file)
+        # Check if the file exists
+        if os.path.exists(pdf_path):
+            print("PDF file exists for splitting.")
+            pages = split_pdf_pages(pdf_path)
+            if not pages:
+                await message.reply_text("Error: Could not split the PDF. It might be empty.")
+                return
 
-    pages = split_pdf_pages(pdf_path)
+            # Send each page as a separate PDF
+            for i, page in enumerate(pages):
+                page_name = f"{user_dir}/page_{i + 1}.pdf"
+                with open(page_name, 'wb') as f:
+                    page.write(f)
+                await client.send_document(message.chat.id, page_name)
+                os.remove(page_name)
 
-    for i, page in enumerate(pages):
-        page_name = f'page_{i + 1}.pdf'
-        with open(page_name, 'wb') as f:
-            page.write(f)
-        with open(page_name, 'rb') as f:
-            await client.send_document(message.chat.id, f)
+            await message.reply_text("Splitting process completed successfully.")
+        else:
+            await message.reply_text(f"Error: File {pdf_path} does not exist.")
+    except Exception as e:
+        await message.reply_text(f"An error occurred: {str(e)}")
+    finally:
+        # Clean up and reset processing status
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        processing_status[message.chat.id] = False
 
-        os.remove(page_name)
-
-    os.remove(pdf_path)
-    processing_status[message.chat.id] = False
-    await message.reply_text("Splitting process completed.")
 
 def split_pdf_pages(file_path):
-    input_pdf = PdfReader(file_path)
-    pages = []
-    for i in range(len(input_pdf.pages)):
-        output = PdfWriter()
-        output.add_page(input_pdf.pages[i])
-        pages.append(output)
-    return pages
+    """
+    Splits a PDF into individual pages and returns a list of PdfWriter objects.
+    """
+    try:
+        input_pdf = PdfReader(file_path)
+        pages = []
+        for i in range(len(input_pdf.pages)):
+            output = PdfWriter()
+            output.add_page(input_pdf.pages[i])
+            pages.append(output)
+        return pages
+    except Exception as e:
+        print(f"Error splitting PDF: {e}")
+        return []
+
 
 @app.on_message(filters.command("image2pdf"))
 async def start_image_to_pdf(client, message):
     chat_id = message.chat.id
+
+    # Reset user's image list and create user-specific directory
     user_images[chat_id] = []
-    await message.reply_text("Send the images you want to convert to PDF.\nWhen you're done, type 'go'.", parse_mode="Markdown")
+    user_dir = get_user_dir(chat_id)
+
+    await message.reply_text("Send the images you want to convert to PDF.\nWhen you're done, type 'go'.")
 
 @app.on_message(filters.photo)
 async def handle_image(client, message):
     chat_id = message.chat.id
-    if chat_id in user_images:
-        file_info = await client.get_file(message.photo.file_id)
-        downloaded_file = await client.download_media(file_info)
 
-        filename = f"{chat_id}_{len(user_images[chat_id])}.jpg"
-        with open(filename, 'wb') as new_file:
-            new_file.write(downloaded_file)
+    # Ensure the user has started the image2pdf process
+    if chat_id not in user_images:
+        return
 
+    # Get user-specific directory
+    user_dir = get_user_dir(chat_id)
+
+    try:
+        # Download the image using the correct Pyrogram method
+        file_path = await message.download()
+
+        # Save the image with a unique filename
+        filename = os.path.join(user_dir, f"{len(user_images[chat_id])}.jpg")
+        os.rename(file_path, filename)
+
+        # Track the image
         user_images[chat_id].append(filename)
-        await message.reply_text(f"Received image {len(user_images[chat_id])}. Send more or type 'go'.", parse_mode="Markdown")
+
+        await message.reply_text(f"Received image {len(user_images[chat_id])}. Send more or type 'go'.")
+
+    except Exception as e:
+        await message.reply_text(f"Error processing image: {str(e)}")
 
 @app.on_message(filters.text & filters.regex("^go$", flags=re.IGNORECASE))
 async def ask_pdf_name(client, message):
     chat_id = message.chat.id
+
     if chat_id not in user_images or not user_images[chat_id]:
         await message.reply_text("You haven't sent any images yet.")
         return
@@ -314,152 +707,72 @@ async def ask_pdf_name(client, message):
 @app.on_message(filters.text & ~filters.command("skip"))
 async def set_pdf_name(client, message):
     chat_id = message.chat.id
+
     if chat_id in user_images:
-        user_pdf_name[chat_id] = message.text.strip() + ".pdf"
+        # Sanitize filename
+        pdf_name = re.sub(r'[<>:"/\\|?*]', '', message.text.strip())
+        user_pdf_name[chat_id] = f"{pdf_name}.pdf"
         await create_pdf(client, message)
 
 @app.on_message(filters.command("skip"))
 async def skip_pdf_name(client, message):
     chat_id = message.chat.id
-    if chat_id in user_images:
-        user_pdf_name[chat_id] = "images.pdf"
-        await create_pdf(client, message)
 
+    if chat_id in user_images:
+        # Check if the user provided a name before skipping
+        if chat_id in user_pdf_name:
+            pdf_name = user_pdf_name[chat_id]
+        else:
+            pdf_name = "images.pdf"
+
+        # Store only the filename without path
+        user_pdf_name[chat_id] = pdf_name
+
+        await create_pdf(client, message)
 async def create_pdf(client, message):
     chat_id = message.chat.id
+
     if chat_id not in user_images or not user_images[chat_id]:
         await message.reply_text("You haven't sent any images yet.")
         return
 
-    pdf_filename = user_pdf_name.get(chat_id, "images.pdf")
-    images = [Image.open(img).convert('RGB') for img in user_images[chat_id]]
-    total_pages = len(images)
+    try:
+        # Use default name if not provided
+        pdf_filename = user_pdf_name.get(chat_id, "images.pdf")
+        # Sanitize the filename to avoid any issues with path and filename formatting
+        pdf_filename = os.path.basename(pdf_filename)  # Strip the path part
 
-    images[0].save(pdf_filename, save_all=True, append_images=images[1:])
+        user_dir = get_user_dir(chat_id)
+        pdf_path = os.path.join(user_dir, pdf_filename)
 
-    with open(pdf_filename, 'rb') as pdf_file:
-        await client.send_document(chat_id, pdf_file)
+        # Open and convert images to PDF
+        images = [Image.open(img).convert('RGB') for img in user_images[chat_id]]
+        total_pages = len(images)
 
-    for img in user_images[chat_id]:
-        os.remove(img)
-    os.remove(pdf_filename)
-    del user_images[chat_id]
-    del user_pdf_name[chat_id]
+        # Save PDF
+        images[0].save(pdf_path, save_all=True, append_images=images[1:])
 
-    await message.reply_text(f"Your PDF has been created and sent! It contains {total_pages} pages.")
+        # Send PDF
+        with open(pdf_path, 'rb') as pdf_file:
+            await client.send_document(chat_id, pdf_file)
 
-@app.on_message(filters.command("resizeimage"))
-async def handle_resize_image_command(client, message):
-    if not message.reply_to_message or not message.reply_to_message.photo:
-        await message.reply_text("Please reply to an image with the /resizeimage command.")
-        return
+        # Clean up
+        for img in user_images[chat_id]:
+            os.remove(img)
+        os.remove(pdf_path)
 
-    photo_id = message.reply_to_message.photo.file_id
-    file_info = await client.get_file(photo_id)
-    downloaded_file = await client.download_media(file_info)
+        # Remove user directory if empty
+        os.rmdir(user_dir)
 
-    image = Image.open(BytesIO(downloaded_file))
+        # Clear user data
+        del user_images[chat_id]
+        del user_pdf_name[chat_id]
 
-    user_settings[message.chat.id] = {
-        'command_state': 'choose_modification',
-        'image': image
-    }
+        await message.reply_text(f"Your PDF has been created and sent! It contains {total_pages} pages.")
 
-    image_details = f"Image Details:\n\n" \
-                    f"File Name: {file_info.file_path}\n" \
-                    f"File Size: {file_info.file_size / (1024 * 1024):.2f} MB " \
-                    f"({file_info.file_size / 1024:.2f} KB)\n" \
-                    f"Image Width: {image.width}px\n" \
-                    f"Image Height: {image.height}px\n"
+    except Exception as e:
+        await message.reply_text(f"Error creating PDF: {str(e)}")
 
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text="Modify File Size", callback_data="modify_file_size")],
-        [InlineKeyboardButton(text="Modify File Dimensions", callback_data="modify_file_dimensions")]
-    ])
-
-    await message.reply_text(f"{image_details}\nPlease choose the modification option:", reply_markup=markup)
-
-@app.on_callback_query()
-async def handle_callback(client, callback_query):
-    chat_id = callback_query.message.chat.id
-
-    if chat_id in user_settings and user_settings[chat_id]['command_state'] == 'choose_modification':
-        action = callback_query.data
-
-        if action == 'modify_file_size':
-            await callback_query.message.reply_text("Please enter the desired file size in kilobytes (KB):")
-            user_settings[chat_id]['command_state'] = 'enter_file_size'
-        elif action == 'modify_file_dimensions':
-            await callback_query.message.reply_text("Please enter the desired width and height in pixels (separated by a space):")
-            user_settings[chat_id]['command_state'] = 'enter_dimensions'
-
-        await callback_query.answer()
-
-@app.on_message(filters.text)
-async def handle_text(client, message):
-    chat_id = message.chat.id
-
-    if chat_id in user_settings:
-        if user_settings[chat_id]['command_state'] == 'enter_file_size':
-            try:
-                target_file_size = float(message.text.strip())
-
-                image = user_settings[chat_id]['image']
-                quality = 80
-                while True:
-                    output = BytesIO()
-                    image.save(output, format='JPEG', quality=quality)
-                    image_size = output.tell() / 1024
-                    if image_size <= target_file_size:
-                        break
-                    quality -= 5
-
-                output.seek(0)
-                with open('resized_image.jpg', 'wb') as f:
-                    f.write(output.read())
-
-                with open('resized_image.jpg', 'rb') as f:
-                    await client.send_photo(chat_id, f)
-
-                resized_details = f"Resized Image Details:\n\n" \
-                                  f"File Name: resized_image.jpg\n" \
-                                  f"File Size: {image_size:.2f} KB\n" \
-                                  f"Image Width: {image.width}px\n" \
-                                  f"Image Height: {image.height}px\n"
-                await message.reply_text(resized_details)
-
-                os.remove('resized_image.jpg')
-            except ValueError:
-                await message.reply_text("Invalid file size. Please enter a valid size in kilobytes (KB).")
-
-            del user_settings[chat_id]
-
-        elif user_settings[chat_id]['command_state'] == 'enter_dimensions':
-            try:
-                dimensions = message.text.strip().split(' ')
-                width, height = int(dimensions[0]), int(dimensions[1])
-
-                image = user_settings[chat_id]['image']
-                image.thumbnail((width, height), Image.LANCZOS)
-
-                output_path = 'resized_image.jpg'
-                image.save(output_path)
-
-                with open(output_path, 'rb') as file:
-                    await client.send_photo(chat_id, file)
-
-                resized_details = f"Resized Image Details:\n\n" \
-                                  f"File Name: resized_image.jpg\n" \
-                                  f"File Size: {os.path.getsize(output_path) / 1024:.2f} KB\n" \
-                                  f"Image Width: {image.width}px\n" \
-                                  f"Image Height: {image.height}px\n"
-                await message.reply_text(resized_details)
-
-                os.remove(output_path)
-            except (IndexError, ValueError):
-                await message.reply_text("Invalid dimensions. Please enter valid width and height values.")
-
-            del user_settings[chat_id]
 
 if __name__ == "__main__":
     if not os.path.exists('merged_pdfs'):
